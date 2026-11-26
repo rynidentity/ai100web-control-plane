@@ -1,0 +1,172 @@
+;; A2A Task State Contract for TON
+;; Stores task lifecycle: submitted → working → completed/failed
+;; Each task is keyed by a unique task_id (uint256)
+;; Only the task creator (initiator) can update state
+;; Artifact hash stored on completion for verifiability
+
+#include "imports/stdlib.fc";
+
+;; Storage layout:
+;; dict task_id -> (initiator:MsgAddress, status:uint8, artifact_hash:uint256, created_at:uint32, updated_at:uint32)
+
+const int STATUS_SUBMITTED = 0;
+const int STATUS_WORKING = 1;
+const int STATUS_INPUT_REQUIRED = 2;
+const int STATUS_COMPLETED = 3;
+const int STATUS_FAILED = 4;
+const int STATUS_CANCELED = 5;
+
+const int OP_SUBMIT_TASK = 0x5355424d;      ;; "SUBM"
+const int OP_UPDATE_STATUS = 0x55505444;    ;; "UPTD"
+const int OP_SET_ARTIFACT = 0x41525446;     ;; "ARTF"
+const int OP_GET_TASK = 0x47455454;         ;; "GETT"
+const int OP_GET_ALL_TASKS = 0x47455441;    ;; "GETA"
+
+cell store_task(slice initiator, int status, int artifact_hash, int created_at, int updated_at) {
+    return begin_cell()
+        .store_slice(initiator)
+        .store_uint(status, 8)
+        .store_uint(artifact_hash, 256)
+        .store_uint(created_at, 32)
+        .store_uint(updated_at, 32)
+        .end_cell();
+}
+
+(slice, int, int, int, int) load_task(cell task_cell) {
+    slice cs = task_cell.begin_parse();
+    return (cs~load_msg_addr(), cs~load_uint(8), cs~load_uint(256), cs~load_uint(32), cs~load_uint(32));
+}
+
+() send_task_response(slice to_addr, int query_id, int task_id, int status, int artifact_hash) {
+    var msg = begin_cell()
+        .store_uint(0x10, 6)              ;; nobounce
+        .store_slice(to_addr)
+        .store_coins(0)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)  ;; empty body prefix
+        .store_uint(0x41524d53, 32)       ;; "ARMS" response magic
+        .store_uint(query_id, 64)
+        .store_uint(task_id, 256)
+        .store_uint(status, 8)
+        .store_uint(artifact_hash, 256)
+        .end_cell();
+    send_raw_message(msg, 64);
+}
+
+() submit_task(slice in_msg_body, slice sender_address) {
+    int task_id = in_msg_body~load_uint(256);
+    int query_id = in_msg_body~load_uint(64);
+
+    var ds = get_data().begin_parse();
+    cell tasks = ds~load_dict();
+    ds.end_parse();
+
+    (slice existing_initiator, int existing_status, _, _, _) = load_task(tasks.dict_get_ref(256, task_id)~~throw_if(0));
+    throw_if(100, ~ cell_null?(tasks.dict_get_ref(256, task_id)));  ;; task already exists
+
+    int now = now();
+    cell new_task = store_task(sender_address, STATUS_SUBMITTED, 0, now, now);
+    tasks~dict_set_ref(256, task_id, new_task);
+
+    set_data(begin_cell().store_dict(tasks).end_cell());
+
+    send_task_response(sender_address, query_id, task_id, STATUS_SUBMITTED, 0);
+}
+
+() update_status(slice in_msg_body, slice sender_address) {
+    int task_id = in_msg_body~load_uint(256);
+    int query_id = in_msg_body~load_uint(64);
+    int new_status = in_msg_body~load_uint(8);
+
+    var ds = get_data().begin_parse();
+    cell tasks = ds~load_dict();
+    ds.end_parse();
+
+    cell task_cell = tasks.dict_get_ref(256, task_id)~~throw_if(101);  ;; task not found
+    (slice initiator, int status, int artifact_hash, int created_at, int updated_at) = load_task(task_cell);
+
+    throw_unless(102, equal_slices(initiator, sender_address));  ;; only initiator
+    throw_if(103, status == STATUS_COMPLETED);  ;; completed is terminal
+    throw_if(104, status == STATUS_CANCELED);   ;; canceled is terminal
+    throw_if(105, new_status > STATUS_CANCELED);
+
+    int now = now();
+    cell updated_task = store_task(initiator, new_status, artifact_hash, created_at, now);
+    tasks~dict_set_ref(256, task_id, updated_task);
+
+    set_data(begin_cell().store_dict(tasks).end_cell());
+
+    send_task_response(sender_address, query_id, task_id, new_status, artifact_hash);
+}
+
+() set_artifact(slice in_msg_body, slice sender_address) {
+    int task_id = in_msg_body~load_uint(256);
+    int query_id = in_msg_body~load_uint(64);
+    int artifact_hash = in_msg_body~load_uint(256);
+
+    var ds = get_data().begin_parse();
+    cell tasks = ds~load_dict();
+    ds.end_parse();
+
+    cell task_cell = tasks.dict_get_ref(256, task_id)~~throw_if(101);
+    (slice initiator, int status, _, int created_at, int updated_at) = load_task(task_cell);
+
+    throw_unless(102, equal_slices(initiator, sender_address));
+    throw_unless(106, status == STATUS_COMPLETED);  ;; artifact only after completion
+
+    int now = now();
+    cell updated_task = store_task(initiator, status, artifact_hash, created_at, now);
+    tasks~dict_set_ref(256, task_id, updated_task);
+
+    set_data(begin_cell().store_dict(tasks).end_cell());
+
+    send_task_response(sender_address, query_id, task_id, status, artifact_hash);
+}
+
+() get_task(slice in_msg_body, slice sender_address) {
+    int task_id = in_msg_body~load_uint(256);
+    int query_id = in_msg_body~load_uint(64);
+
+    var ds = get_data().begin_parse();
+    cell tasks = ds~load_dict();
+    ds.end_parse();
+
+    cell task_cell = tasks.dict_get_ref(256, task_id)~~throw_if(101);
+    (slice initiator, int status, int artifact_hash, int created_at, int updated_at) = load_task(task_cell);
+
+    send_task_response(sender_address, query_id, task_id, status, artifact_hash);
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) {
+    if (in_msg_body.slice_empty?()) {
+        return;  ;; empty message, do nothing
+    }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    slice sender_address = cs~load_msg_addr();
+
+    int op = in_msg_body~load_uint(32);
+
+    if (op == OP_SUBMIT_TASK) {
+        submit_task(in_msg_body, sender_address);
+    } else if (op == OP_UPDATE_STATUS) {
+        update_status(in_msg_body, sender_address);
+    } else if (op == OP_SET_ARTIFACT) {
+        set_artifact(in_msg_body, sender_address);
+    } else if (op == OP_GET_TASK) {
+        get_task(in_msg_body, sender_address);
+    } else {
+        throw(0xFFFF);  ;; unknown op
+    }
+}
+
+() get_task_external(int task_id) method_id {
+    var ds = get_data().begin_parse();
+    cell tasks = ds~load_dict();
+    ds.end_parse();
+
+    cell task_cell = tasks.dict_get_ref(256, task_id)~~throw_if(101);
+    (slice initiator, int status, int artifact_hash, int created_at, int updated_at) = load_task(task_cell);
+
+    return (status, artifact_hash, created_at, updated_at);
+}
